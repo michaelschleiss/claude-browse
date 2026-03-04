@@ -6,7 +6,8 @@ Usage:
   claude-browse <file.jsonl> # browse a specific conversation file
   claude-browse --all        # pick from all projects
 
-Navigate: j/k (older/newer), d/u (scroll down/up), s (select), x (export), q (quit)
+Navigate: j/k (older/newer), d/u (scroll down/up), s (select), x (export),
+          t (trim bloat), T (trim all), q (quit)
 """
 
 import json, sys, os, tty, termios, shutil, argparse, uuid
@@ -14,6 +15,9 @@ from pathlib import Path
 from datetime import datetime
 
 CLAUDE_DIR = Path.home() / '.config' / 'claude' / 'projects'
+
+# Fields in toolUseResult that are large and not needed for conversation context
+BLOAT_FIELDS = {'originalFile'}
 
 
 def cwd_to_project_dir(cwd=None):
@@ -144,6 +148,67 @@ def pick_conversation(files):
         raise
 
 
+def fmt_size(n):
+    """Format byte count as human-readable string."""
+    if n < 1024:
+        return f"{n}B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.0f}K"
+    else:
+        return f"{n / (1024 * 1024):.1f}M"
+
+
+def compute_exchange_sizes(raw_lines, exchanges):
+    """Compute raw size and bloat size for each exchange.
+
+    Returns list of (total_size, bloat_size) tuples, one per exchange.
+    """
+    sizes = []
+    for ex in exchanges:
+        total = 0
+        bloat = 0
+        for li in ex['line_indices']:
+            line = raw_lines[li]
+            total += len(line)
+            try:
+                obj = json.loads(line)
+                tur = obj.get('toolUseResult', {})
+                for field in BLOAT_FIELDS:
+                    val = tur.get(field, '')
+                    if val:
+                        bloat += len(json.dumps(val))
+            except Exception:
+                pass
+        sizes.append((total, bloat))
+    return sizes
+
+
+def trim_exchange(raw_lines, exchanges, exchange_idx):
+    """Strip bloat fields from toolUseResult in an exchange's raw lines.
+
+    Modifies raw_lines in place. Returns bytes saved.
+    """
+    saved = 0
+    for li in exchanges[exchange_idx]['line_indices']:
+        line = raw_lines[li]
+        try:
+            obj = json.loads(line)
+            tur = obj.get('toolUseResult')
+            if not tur:
+                continue
+            trimmed = False
+            for field in BLOAT_FIELDS:
+                if field in tur and tur[field]:
+                    saved += len(json.dumps(tur[field]))
+                    tur[field] = ''
+                    trimmed = True
+            if trimmed:
+                raw_lines[li] = json.dumps(obj)
+        except Exception:
+            pass
+    return saved
+
+
 def parse_conversation(path):
     """Parse JSONL into logical exchanges.
 
@@ -239,8 +304,11 @@ def parse_conversation(path):
     return raw_lines, preamble_indices, exchanges
 
 
-def export_jsonl(raw_lines, preamble_indices, exchanges, selected_set, source_path):
-    """Export selected exchanges as a new JSONL file."""
+def export_jsonl(raw_lines, preamble_indices, exchanges, selected_set, source_path, trim=True):
+    """Export selected exchanges as a new JSONL file.
+
+    If trim=True, strips bloat fields from toolUseResult before writing.
+    """
     project_dir = source_path.parent
     new_session_id = str(uuid.uuid4())
     new_path = project_dir / f"{new_session_id}.jsonl"
@@ -252,6 +320,7 @@ def export_jsonl(raw_lines, preamble_indices, exchanges, selected_set, source_pa
             include_indices.add(li)
 
     # Rewrite lines with new session ID
+    total_saved = 0
     with open(new_path, 'w') as f:
         for i, line in enumerate(raw_lines):
             if i not in include_indices:
@@ -260,9 +329,17 @@ def export_jsonl(raw_lines, preamble_indices, exchanges, selected_set, source_pa
             # Update session ID so Claude Code treats it as a new session
             if 'sessionId' in obj:
                 obj['sessionId'] = new_session_id
+            # Strip bloat if requested
+            if trim:
+                tur = obj.get('toolUseResult')
+                if tur:
+                    for field in BLOAT_FIELDS:
+                        if field in tur and tur[field]:
+                            total_saved += len(json.dumps(tur[field]))
+                            tur[field] = ''
             f.write(json.dumps(obj) + '\n')
 
-    return new_path, new_session_id
+    return new_path, new_session_id, total_saved
 
 
 def browse(raw_lines, preamble_indices, exchanges, source_path):
@@ -273,6 +350,9 @@ def browse(raw_lines, preamble_indices, exchanges, source_path):
     idx = len(exchanges) - 1
     scroll = 0
     selected = set()
+    trimmed = set()  # exchanges that have been trimmed
+    sizes = compute_exchange_sizes(raw_lines, exchanges)
+    total_saved = 0
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
 
@@ -282,16 +362,35 @@ def browse(raw_lines, preamble_indices, exchanges, source_path):
         os.system('clear')
         n = len(exchanges)
         n_sel = len(selected)
+        ex_size, ex_bloat = sizes[idx]
 
         sel_indicator = f"  \033[1;35m{n_sel} selected\033[0m" if n_sel else ""
         is_sel = " \033[1;35m★\033[0m" if idx in selected else ""
+        is_trimmed = " \033[1;32m✂\033[0m" if idx in trimmed else ""
+
+        # Size indicator with bloat warning
+        size_str = fmt_size(ex_size)
+        if ex_bloat > 10000:
+            bloat_str = f" \033[1;31m({fmt_size(ex_bloat)} bloat)\033[0m"
+        elif ex_bloat > 0:
+            bloat_str = f" \033[33m({fmt_size(ex_bloat)} bloat)\033[0m"
+        else:
+            bloat_str = ""
+
+        saved_str = f"  \033[1;32msaved {fmt_size(total_saved)}\033[0m" if total_saved else ""
+
         header = (
-            f"  \033[1m{idx+1}/{n}\033[0m{is_sel}{sel_indicator}"
-            f"    [\033[33mj/k\033[0m nav] [\033[33md/u\033[0m scroll]"
-            f" [\033[33ms\033[0m select] [\033[33mx\033[0m export] [\033[33mq\033[0m quit]"
+            f"  \033[1m{idx+1}/{n}\033[0m{is_sel}{is_trimmed}"
+            f"  {size_str}{bloat_str}{sel_indicator}{saved_str}"
+        )
+        keys = (
+            f"  [\033[33mj/k\033[0m nav] [\033[33md/u\033[0m scroll]"
+            f" [\033[33ms\033[0m select] [\033[33mt\033[0m trim] [\033[33mT\033[0m trim all]"
+            f" [\033[33mx\033[0m export] [\033[33mq\033[0m quit]"
         )
         print(f"\033[36m{'─' * cols}\033[0m")
         print(header)
+        print(keys)
         print(f"\033[36m{'─' * cols}\033[0m")
 
         ex = exchanges[idx]
@@ -310,7 +409,7 @@ def browse(raw_lines, preamble_indices, exchanges, source_path):
         for l in assistant.split('\n'):
             output_lines.append(f"  {l}")
 
-        avail = rows - 4
+        avail = rows - 5
         visible = output_lines[scroll:scroll + avail]
         for l in visible:
             print(l)
@@ -334,12 +433,12 @@ def browse(raw_lines, preamble_indices, exchanges, source_path):
                 total_lines = show()
             elif ch == 'd':
                 _, rows = shutil.get_terminal_size((80, 24))
-                avail = rows - 4
+                avail = rows - 5
                 scroll = min(scroll + avail // 2, max(0, total_lines - avail))
                 show()
             elif ch == 'u':
                 _, rows = shutil.get_terminal_size((80, 24))
-                avail = rows - 4
+                avail = rows - 5
                 scroll = max(0, scroll - avail // 2)
                 show()
             elif ch == 's':
@@ -347,6 +446,25 @@ def browse(raw_lines, preamble_indices, exchanges, source_path):
                     selected.remove(idx)
                 else:
                     selected.add(idx)
+                show()
+            elif ch == 't':
+                # Trim bloat from current exchange
+                _, bloat = sizes[idx]
+                if bloat > 0 and idx not in trimmed:
+                    saved = trim_exchange(raw_lines, exchanges, idx)
+                    total_saved += saved
+                    trimmed.add(idx)
+                    sizes[idx] = (sizes[idx][0] - saved, 0)
+                show()
+            elif ch == 'T':
+                # Trim all exchanges with bloat
+                for i in range(len(exchanges)):
+                    _, bloat = sizes[i]
+                    if bloat > 0 and i not in trimmed:
+                        saved = trim_exchange(raw_lines, exchanges, i)
+                        total_saved += saved
+                        trimmed.add(i)
+                        sizes[i] = (sizes[i][0] - saved, 0)
                 show()
             elif ch == 'x':
                 if not selected:
@@ -357,15 +475,19 @@ def browse(raw_lines, preamble_indices, exchanges, source_path):
                     tty.setcbreak(fd)
                     show()
                     continue
-                # Export
+                # Export (always trims bloat from exported file)
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                new_path, new_session_id = export_jsonl(
-                    raw_lines, preamble_indices, exchanges, selected, source_path
+                new_path, new_session_id, export_saved = export_jsonl(
+                    raw_lines, preamble_indices, exchanges, selected, source_path, trim=True
                 )
                 os.system('clear')
                 n_sel = len(selected)
+                orig_size = sum(len(raw_lines[li]) for idx in selected for li in exchanges[idx]['line_indices'])
+                new_size = new_path.stat().st_size
                 print(f"\033[1;32mExported {n_sel} exchanges to:\033[0m")
                 print(f"  {new_path}")
+                if export_saved:
+                    print(f"  \033[32mTrimmed {fmt_size(export_saved)} of bloat (originalFile data)\033[0m")
                 print()
                 print(f"\033[1mResume with:\033[0m")
                 print(f"  claude --resume {new_session_id}")
@@ -382,6 +504,8 @@ def main():
     parser = argparse.ArgumentParser(description='Browse Claude Code conversation history')
     parser.add_argument('file', nargs='?', help='Specific JSONL file to browse')
     parser.add_argument('--all', action='store_true', help='Pick from all projects')
+    parser.add_argument('--trim', action='store_true',
+                        help='Trim bloat (originalFile) from all exchanges and rewrite file in-place')
     args = parser.parse_args()
 
     if args.file:
@@ -400,6 +524,26 @@ def main():
             path = files[0]
         else:
             path = pick_conversation(files)
+
+    # Non-interactive trim mode: rewrite the file in place
+    if args.trim:
+        raw_lines, preamble_indices, exchanges = parse_conversation(path)
+        total_saved = 0
+        n_trimmed = 0
+        for i in range(len(exchanges)):
+            saved = trim_exchange(raw_lines, exchanges, i)
+            if saved > 0:
+                total_saved += saved
+                n_trimmed += 1
+        if total_saved > 0:
+            with open(path, 'w') as f:
+                for line in raw_lines:
+                    f.write(line + '\n')
+            print(f"Trimmed {n_trimmed} exchanges, saved {fmt_size(total_saved)}")
+            print(f"  {path}")
+        else:
+            print("No bloat found to trim.")
+        return
 
     raw_lines, preamble_indices, exchanges = parse_conversation(path)
     browse(raw_lines, preamble_indices, exchanges, path)
