@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Browse Claude Code conversation history.
+
+Usage:
+  claude-browse              # pick from recent conversations in current project
+  claude-browse <file.jsonl> # browse a specific conversation file
+  claude-browse --all        # pick from all projects
+
+Navigate: j/k (older/newer), d/u (scroll down/up), q (quit)
+"""
+
+import json, sys, os, tty, termios, shutil, glob, argparse
+from pathlib import Path
+from datetime import datetime
+
+CLAUDE_DIR = Path.home() / '.config' / 'claude' / 'projects'
+
+
+def cwd_to_project_dir(cwd=None):
+    """Find the Claude project config dir for a working directory."""
+    cwd = cwd or os.getcwd()
+
+    # Try exact encoding first (replace / with -)
+    encoded = cwd.replace('/', '-')
+    exact = CLAUDE_DIR / encoded
+    if exact.exists():
+        return exact
+
+    # Normalize: replace both / and _ with - and find match
+    if CLAUDE_DIR.exists():
+        normalized = cwd.replace('/', '-').replace('_', '-').lower()
+        for d in CLAUDE_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            if d.name.replace('_', '-').lower() == normalized:
+                return d
+
+    # Also try parent dirs (maybe user is in a subdirectory)
+    if CLAUDE_DIR.exists():
+        parts = cwd.rstrip('/').split('/')
+        for i in range(len(parts), 0, -1):
+            parent = '/'.join(parts[:i])
+            normalized = parent.replace('/', '-').replace('_', '-').lower()
+            for d in CLAUDE_DIR.iterdir():
+                if not d.is_dir():
+                    continue
+                if d.name.replace('_', '-').lower() == normalized:
+                    return d
+
+    return exact
+
+
+def list_conversations(project_dir):
+    """List JSONL files sorted by modification time (newest first)."""
+    files = sorted(project_dir.glob('*.jsonl'), key=lambda f: f.stat().st_mtime, reverse=True)
+    return files
+
+
+def peek_conversation(path):
+    """Get first user message and message count for preview."""
+    first_user = None
+    assistant_count = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                obj = json.loads(line.strip())
+                t = obj.get('type')
+                if t == 'user' and first_user is None:
+                    msg = obj.get('message', {})
+                    content = msg.get('content', [])
+                    if isinstance(content, str):
+                        first_user = content[:80]
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                first_user = block['text'][:80]
+                                break
+                elif t == 'assistant':
+                    msg = obj.get('message', {})
+                    content = msg.get('content', [])
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                assistant_count += 1
+                                break
+    except Exception:
+        pass
+    return first_user or '(empty)', assistant_count
+
+
+def pick_conversation(files):
+    """Interactive picker for conversation files."""
+    if not files:
+        print("No conversations found.")
+        sys.exit(1)
+
+    # show up to 15 most recent
+    files = files[:15]
+    previews = []
+    for f in files:
+        mtime = datetime.fromtimestamp(f.stat().st_mtime)
+        first_msg, n_answers = peek_conversation(f)
+        previews.append((f, mtime, first_msg, n_answers))
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    selected = 0
+
+    def draw():
+        cols, rows = shutil.get_terminal_size((80, 24))
+        os.system('clear')
+        print(f"\033[1mSelect a conversation\033[0m  [\033[33mj/k\033[0m move] [\033[33mENTER\033[0m select] [\033[33mq\033[0m quit]")
+        print(f"\033[36m{'─' * cols}\033[0m")
+        for i, (f, mtime, first_msg, n_answers) in enumerate(previews):
+            marker = '\033[1;33m▸\033[0m' if i == selected else ' '
+            date_str = mtime.strftime('%Y-%m-%d %H:%M')
+            # clean up system-reminder noise from first_msg
+            clean = first_msg.strip()
+            if clean.startswith('<system'):
+                clean = '(system message)'
+            trunc = clean[:cols - 40]
+            highlight = '\033[1m' if i == selected else '\033[2m'
+            print(f"  {marker} {highlight}{date_str}  ({n_answers:2d} msgs)  {trunc}\033[0m")
+
+    try:
+        tty.setcbreak(fd)
+        draw()
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == 'q':
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                os.system('clear')
+                sys.exit(0)
+            elif ch == 'j' and selected < len(previews) - 1:
+                selected += 1
+                draw()
+            elif ch == 'k' and selected > 0:
+                selected -= 1
+                draw()
+            elif ch in ('\r', '\n'):
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                return previews[selected][0]
+    except Exception:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        raise
+
+
+def extract_pairs(path):
+    with open(path) as f:
+        lines = f.readlines()
+
+    pairs = []
+    last_user = None
+
+    for line in lines:
+        obj = json.loads(line.strip())
+        t = obj.get('type')
+        msg = obj.get('message', {})
+        content = msg.get('content', [])
+
+        if t == 'user':
+            texts = []
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        texts.append(block['text'])
+            if texts:
+                last_user = '\n'.join(texts)
+
+        elif t == 'assistant':
+            texts = []
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        texts.append(block['text'])
+            if texts:
+                pairs.append((last_user or '(no prompt)', '\n'.join(texts)))
+
+    return pairs
+
+
+def browse(pairs):
+    if not pairs:
+        print("No message pairs found.")
+        sys.exit(1)
+
+    idx = len(pairs) - 1
+    scroll = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    def show():
+        nonlocal scroll
+        cols, rows = shutil.get_terminal_size((80, 24))
+        os.system('clear')
+        n = len(pairs)
+
+        header = f"  \033[1m{idx+1}/{n}\033[0m    [\033[33mj\033[0m older] [\033[33mk\033[0m newer] [\033[33md/u\033[0m scroll] [\033[33mq\033[0m quit]"
+        print(f"\033[36m{'─' * cols}\033[0m")
+        print(header)
+        print(f"\033[36m{'─' * cols}\033[0m")
+
+        user, assistant = pairs[idx]
+
+        output_lines = []
+        output_lines.append(f"\033[1;32m▶ You:\033[0m")
+        for l in (user or '').split('\n'):
+            # strip system-reminder tags for readability
+            stripped = l.strip()
+            if stripped.startswith('<system-reminder>') or stripped.startswith('</system-reminder>'):
+                continue
+            output_lines.append(f"  \033[32m{l}\033[0m")
+        output_lines.append('')
+        output_lines.append(f"\033[1;34m◀ Claude:\033[0m")
+        for l in assistant.split('\n'):
+            output_lines.append(f"  {l}")
+
+        avail = rows - 4
+        visible = output_lines[scroll:scroll + avail]
+        for l in visible:
+            print(l)
+
+        return len(output_lines)
+
+    try:
+        total_lines = show()
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == 'q':
+                break
+            elif ch == 'j' and idx > 0:
+                idx -= 1
+                scroll = 0
+                total_lines = show()
+            elif ch == 'k' and idx < len(pairs) - 1:
+                idx += 1
+                scroll = 0
+                total_lines = show()
+            elif ch == 'd':
+                _, rows = shutil.get_terminal_size((80, 24))
+                avail = rows - 4
+                scroll = min(scroll + avail // 2, max(0, total_lines - avail))
+                show()
+            elif ch == 'u':
+                _, rows = shutil.get_terminal_size((80, 24))
+                avail = rows - 4
+                scroll = max(0, scroll - avail // 2)
+                show()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.system('clear')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Browse Claude Code conversation history')
+    parser.add_argument('file', nargs='?', help='Specific JSONL file to browse')
+    parser.add_argument('--all', action='store_true', help='Pick from all projects')
+    args = parser.parse_args()
+
+    if args.file:
+        path = Path(args.file)
+    elif args.all:
+        # gather from all projects
+        all_files = sorted(CLAUDE_DIR.glob('*/*.jsonl'), key=lambda f: f.stat().st_mtime, reverse=True)
+        path = pick_conversation(all_files)
+    else:
+        project_dir = cwd_to_project_dir()
+        if not project_dir.exists():
+            print(f"No Claude project found for {os.getcwd()}")
+            print(f"Expected: {project_dir}")
+            sys.exit(1)
+        files = list_conversations(project_dir)
+        if len(files) == 1:
+            path = files[0]
+        else:
+            path = pick_conversation(files)
+
+    pairs = extract_pairs(path)
+    browse(pairs)
+
+
+if __name__ == '__main__':
+    main()
