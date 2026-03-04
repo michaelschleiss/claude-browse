@@ -6,10 +6,10 @@ Usage:
   claude-browse <file.jsonl> # browse a specific conversation file
   claude-browse --all        # pick from all projects
 
-Navigate: j/k (older/newer), d/u (scroll down/up), q (quit)
+Navigate: j/k (older/newer), d/u (scroll down/up), s (select), x (export), q (quit)
 """
 
-import json, sys, os, tty, termios, shutil, glob, argparse
+import json, sys, os, tty, termios, shutil, argparse, uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -114,7 +114,6 @@ def pick_conversation(files):
         for i, (f, mtime, first_msg, n_answers) in enumerate(previews):
             marker = '\033[1;33m▸\033[0m' if i == selected else ' '
             date_str = mtime.strftime('%Y-%m-%d %H:%M')
-            # clean up system-reminder noise from first_msg
             clean = first_msg.strip()
             if clean.startswith('<system'):
                 clean = '(system message)'
@@ -145,20 +144,44 @@ def pick_conversation(files):
         raise
 
 
-def extract_pairs(path):
+def parse_conversation(path):
+    """Parse JSONL into logical exchanges.
+
+    Returns:
+        raw_lines: list of raw JSONL strings
+        exchanges: list of dicts with:
+            - user_text: display text for the user prompt
+            - assistant_text: display text for the assistant response
+            - line_indices: list of indices into raw_lines for all JSONL entries
+              that belong to this exchange (user, assistant, tool rounds, progress, etc.)
+    """
     with open(path) as f:
-        lines = f.readlines()
+        raw_lines = [line.strip() for line in f if line.strip()]
 
-    pairs = []
-    last_user = None
+    parsed = []
+    for line in raw_lines:
+        parsed.append(json.loads(line))
 
-    for line in lines:
-        obj = json.loads(line.strip())
+    # Group into exchanges: each exchange starts at a user message that has text content
+    # and includes everything until the next user message with text content.
+    # We also track "preamble" lines (system, file-history-snapshot) before the first user msg.
+
+    exchanges = []
+    preamble_indices = []  # lines before first user text message
+    current_user_text = None
+    current_assistant_texts = []
+    current_line_indices = []
+    in_preamble = True
+
+    for i, obj in enumerate(parsed):
         t = obj.get('type')
-        msg = obj.get('message', {})
-        content = msg.get('content', [])
 
+        # Check if this is a user message with actual text content
+        is_user_text = False
+        user_text = None
         if t == 'user':
+            msg = obj.get('message', {})
+            content = msg.get('content', [])
             texts = []
             if isinstance(content, str):
                 texts.append(content)
@@ -167,27 +190,89 @@ def extract_pairs(path):
                     if isinstance(block, dict) and block.get('type') == 'text':
                         texts.append(block['text'])
             if texts:
-                last_user = '\n'.join(texts)
+                is_user_text = True
+                user_text = '\n'.join(texts)
 
-        elif t == 'assistant':
-            texts = []
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        texts.append(block['text'])
-            if texts:
-                pairs.append((last_user or '(no prompt)', '\n'.join(texts)))
+        if is_user_text:
+            in_preamble = False
+            # Save previous exchange if exists
+            if current_user_text is not None and current_assistant_texts:
+                exchanges.append({
+                    'user_text': current_user_text,
+                    'assistant_text': '\n'.join(current_assistant_texts),
+                    'line_indices': current_line_indices[:],
+                })
+            elif current_user_text is not None:
+                # user message with no assistant response yet — still save
+                exchanges.append({
+                    'user_text': current_user_text,
+                    'assistant_text': '(no response)',
+                    'line_indices': current_line_indices[:],
+                })
+            # Start new exchange
+            current_user_text = user_text
+            current_assistant_texts = []
+            current_line_indices = [i]
+        elif in_preamble:
+            preamble_indices.append(i)
+        else:
+            # Part of current exchange
+            current_line_indices.append(i)
 
-    return pairs
+            # Extract assistant text for display
+            if t == 'assistant':
+                msg = obj.get('message', {})
+                content = msg.get('content', [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            current_assistant_texts.append(block['text'])
+
+    # Save last exchange
+    if current_user_text is not None and current_assistant_texts:
+        exchanges.append({
+            'user_text': current_user_text,
+            'assistant_text': '\n'.join(current_assistant_texts),
+            'line_indices': current_line_indices[:],
+        })
+
+    return raw_lines, preamble_indices, exchanges
 
 
-def browse(pairs):
-    if not pairs:
+def export_jsonl(raw_lines, preamble_indices, exchanges, selected_set, source_path):
+    """Export selected exchanges as a new JSONL file."""
+    project_dir = source_path.parent
+    new_session_id = str(uuid.uuid4())
+    new_path = project_dir / f"{new_session_id}.jsonl"
+
+    # Collect all line indices to include: preamble + selected exchanges
+    include_indices = set(preamble_indices)
+    for idx in selected_set:
+        for li in exchanges[idx]['line_indices']:
+            include_indices.add(li)
+
+    # Rewrite lines with new session ID
+    with open(new_path, 'w') as f:
+        for i, line in enumerate(raw_lines):
+            if i not in include_indices:
+                continue
+            obj = json.loads(line)
+            # Update session ID so Claude Code treats it as a new session
+            if 'sessionId' in obj:
+                obj['sessionId'] = new_session_id
+            f.write(json.dumps(obj) + '\n')
+
+    return new_path, new_session_id
+
+
+def browse(raw_lines, preamble_indices, exchanges, source_path):
+    if not exchanges:
         print("No message pairs found.")
         sys.exit(1)
 
-    idx = len(pairs) - 1
+    idx = len(exchanges) - 1
     scroll = 0
+    selected = set()
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
 
@@ -195,19 +280,27 @@ def browse(pairs):
         nonlocal scroll
         cols, rows = shutil.get_terminal_size((80, 24))
         os.system('clear')
-        n = len(pairs)
+        n = len(exchanges)
+        n_sel = len(selected)
 
-        header = f"  \033[1m{idx+1}/{n}\033[0m    [\033[33mj\033[0m older] [\033[33mk\033[0m newer] [\033[33md/u\033[0m scroll] [\033[33mq\033[0m quit]"
+        sel_indicator = f"  \033[1;35m{n_sel} selected\033[0m" if n_sel else ""
+        is_sel = " \033[1;35m★\033[0m" if idx in selected else ""
+        header = (
+            f"  \033[1m{idx+1}/{n}\033[0m{is_sel}{sel_indicator}"
+            f"    [\033[33mj/k\033[0m nav] [\033[33md/u\033[0m scroll]"
+            f" [\033[33ms\033[0m select] [\033[33mx\033[0m export] [\033[33mq\033[0m quit]"
+        )
         print(f"\033[36m{'─' * cols}\033[0m")
         print(header)
         print(f"\033[36m{'─' * cols}\033[0m")
 
-        user, assistant = pairs[idx]
+        ex = exchanges[idx]
+        user = ex['user_text']
+        assistant = ex['assistant_text']
 
         output_lines = []
         output_lines.append(f"\033[1;32m▶ You:\033[0m")
         for l in (user or '').split('\n'):
-            # strip system-reminder tags for readability
             stripped = l.strip()
             if stripped.startswith('<system-reminder>') or stripped.startswith('</system-reminder>'):
                 continue
@@ -235,7 +328,7 @@ def browse(pairs):
                 idx -= 1
                 scroll = 0
                 total_lines = show()
-            elif ch == 'k' and idx < len(pairs) - 1:
+            elif ch == 'k' and idx < len(exchanges) - 1:
                 idx += 1
                 scroll = 0
                 total_lines = show()
@@ -249,9 +342,40 @@ def browse(pairs):
                 avail = rows - 4
                 scroll = max(0, scroll - avail // 2)
                 show()
+            elif ch == 's':
+                if idx in selected:
+                    selected.remove(idx)
+                else:
+                    selected.add(idx)
+                show()
+            elif ch == 'x':
+                if not selected:
+                    # flash message
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    print("\033[1;31mNo messages selected. Use 's' to select first.\033[0m")
+                    import time; time.sleep(1)
+                    tty.setcbreak(fd)
+                    show()
+                    continue
+                # Export
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                new_path, new_session_id = export_jsonl(
+                    raw_lines, preamble_indices, exchanges, selected, source_path
+                )
+                os.system('clear')
+                n_sel = len(selected)
+                print(f"\033[1;32mExported {n_sel} exchanges to:\033[0m")
+                print(f"  {new_path}")
+                print()
+                print(f"\033[1mResume with:\033[0m")
+                print(f"  claude --resume {new_session_id}")
+                print()
+                return
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        os.system('clear')
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
 
 def main():
@@ -263,7 +387,6 @@ def main():
     if args.file:
         path = Path(args.file)
     elif args.all:
-        # gather from all projects
         all_files = sorted(CLAUDE_DIR.glob('*/*.jsonl'), key=lambda f: f.stat().st_mtime, reverse=True)
         path = pick_conversation(all_files)
     else:
@@ -278,8 +401,8 @@ def main():
         else:
             path = pick_conversation(files)
 
-    pairs = extract_pairs(path)
-    browse(pairs)
+    raw_lines, preamble_indices, exchanges = parse_conversation(path)
+    browse(raw_lines, preamble_indices, exchanges, path)
 
 
 if __name__ == '__main__':
